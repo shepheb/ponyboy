@@ -1002,6 +1002,32 @@ actor CPU
 
 
 actor Controller
-  // TODO: Implement these properly.
+  """
+  Plan and design for the controller:
+  - Gets passed the loaded ROM as an Array[U8] val at startup.
+  - Creates a CPU, GPU and sound controller.
+  - Sets up a series of timers to call it periodically.
+    - Hopefully these timers are fast enough to do a ~1us timer for the GB
+      cycles.
+    - The strict frequency of the Gameboy is 4,194,304 clocks per second.
+      - Which is 1,048,576 machine cycles per second.
+      - Or an interval of 953.674316 nanoseconds.
+  - It counts the cycles off, and calls the CPU, GPU and others.
+    - The GPU gets called when it's time to do the next line.
+      - The STAT also needs to be updated at that point.
+  - OAM and VRAM are isos that are flipped periodically between CPU and GPU.
+    - Those two are independent! See the usual cycles flow.
+  - DMAs can be kicked off anytime. DMA reloads the OAM from some RAM. I don't
+    know what happens to the GPU during a DMA. Since the RAM is inaccessible
+    during a DMA, we can do the copy instantly, I guess.
+    - I don't know what happens to the GPU during that process.
+    - For now I'll just model it as instant.
+    - I'm not sure if the CPU needs to be allowed to write OAM to start a DMA.
+      They take 160 cycles - longer than an HBlank, I think? How does this work?
+
+  TODO: Figure out DMA and its restrictions, then figure out a plan for them.
+  TODO: Test the Pony timers library to see if it fires reliably enough to use
+  at this frequency.
+  """
   be halt() => None
   be stop() => None
