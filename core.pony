@@ -2,7 +2,105 @@ use "collections"
 use "time"
 use "debug"
 
+primitive Ports
+  fun lcdc(): U16 => 0xff40
+  fun stat(): U16 => 0xff41
+  fun scy(): U16 => 0xff42
+  fun scx(): U16 => 0xff43
+  fun ly(): U16 => 0xff44
+  fun lyc(): U16 => 0xff45
+  fun wx(): U16 => 0xff4a
+  fun wy(): U16 => 0xff4b
+  fun bgp(): U16 => 0xff47
+  fun obp0(): U16 => 0xff48
+  fun obp1(): U16 => 0xff49
+  fun dma(): U16 => 0xff46
+  // TODO: Sound!
+  fun joyp(): U16 => 0xff00
+  // TODO: Link cable!
+  fun tdiv(): U16 => 0xff04
+  fun tima(): U16 => 0xff05
+  fun tma(): U16 => 0xff06
+  fun tac(): U16 => 0xff07
+
+  fun iflag(): U16 => 0xff0f
+  fun ienable(): U16 => 0xffff
+
+primitive Interrupts
+  fun vblank_mask(): U8 => 0x01
+  fun stat_mask():   U8 => 0x02
+  fun timer_mask():  U8 => 0x04
+  fun serial_mask(): U8 => 0x08
+  fun joypad_mask(): U8 => 0x10
+
+  fun vector_vblank(): U16 => 0x40
+  fun vector_stat():   U16 => 0x48
+  fun vector_timer():  U16 => 0x50
+  fun vector_serial(): U16 => 0x58
+  fun vector_joypad(): U16 => 0x60
+
 actor CPU
+  """
+  Plan and design for the CPU:
+  - Gets passed the loaded ROM as an Array[U8] val at startup.
+  - Sets up the CPU
+  - Creates a GPU and sound controller.
+  - Repeatedly calls run_single_opcode, counting elapsed cycles.
+    - Cycles through each display line on a fixed schedule (see below).
+    - At point where the memory becomes inaccessible to the CPU, tell the GPU to
+      paint that line.
+    - At the start of the VBlank, flip the painted lines onto the display.
+    - The clock frequency of the Gameboy is 4,194,304 clocks per second.
+      - Which is 1,048,576 machine cycles per second.
+  - OAM and VRAM are isos that are flipped periodically between CPU and GPU.
+    - Those two are independent! See below for the timing and how that works.
+  - DMAs can be kicked off anytime according to some docs. Others say that the
+    OAM needs to be accessible to start a DMA. HBlanks are too short for a
+    complete DMA, so this doesn't work.
+    - Since only HRAM is accessible by the CPU during the DMA, we can simply do
+      the copy instantly and continue blocking all access to the memory.
+
+  Here's the complete state diagram for the CPU and GPU, with timings:
+  - Mode 1: VBlank, CPU owns the memory. We start here, effectively, because the
+    display starts out disabled.
+  ======
+  - Mode 2: OAM locked. The CPU sends the OAM iso to the GPU.
+    STAT, LY, etc. are updated at this point.
+    Timing: "77-83 clks" is 80 clks = 20 cycles
+  - Mode 3: Both locked. The CPU sends the VRAM iso to the GPU.
+    The line is actually rendered at this point.
+    Timing: "169-175 clks" 172 clks = 43 cycles
+  - Mode 0: HBlank. Both memory isos are returned to the CPU.
+    Timing: "201-207 clks" is 204 clks = 51 cycles
+  ======
+  The above cycles once for each line from 0 to 143, then VBlank begins. The
+  LY is still updated every 456 ticks, but there's 10(?) lines worth of dead
+  time. VBlank lasts 4560 clks = 1140 cycles. A complete frame lasts 70224 clks
+  or 17556 cycles, for a framerate of 1,048,576 / 17556 = 59.7275 fps
+
+  Since VBlank follows HBlank, no iso juggling happens there.
+
+
+  Timers and such
+  ===============
+  - $FF04 DIV is incremented at a rate of 16,384Hz, which is every 64 cycles.
+  - $FF05 TIMA is incremented at one of four rates. It can be written, in which
+    case it continues ticking from the new value.
+  - $FF06 TMA is the "modulus", this value is put into TIMA after it exceeds $FF
+  - $FF07 TAC is the timer control. It enables and disables the timer, and
+    chooses the frequency:
+    - 00:   4096 Hz = every 256 cycles
+    - 01: 262144 Hz = every   4 cycles
+    - 02:  65535 Hz = every  16 cycles
+    - 03:  16384 Hz = every  64 cycles
+
+
+
+
+  TODO: See if I can pin down exactly when a DMA can be launched.
+  """
+  let gpu: GPU tag
+
   var regs: Array[U8] ref // A F B C D E H L
   var flags: U8 // that's ZNHC----
   var pc: U16
@@ -14,11 +112,13 @@ actor CPU
   // mapped to all the various locations.
   var rom: Array[U8] // Read-only, maybe banked, found on the cart.
   var ram: Array[U8] // Read-write, maybe banked, found on the cart.
+
   // Read-write, but restricted to VBlank. Lobbed back and forth with the GPU,
   // hence the None.
   var vram: (Array[U8] iso | None)
+  var oam:  (Array[U8] iso | None)
+
   var wram: Array[U8] // Read-write, no bank (except in CGB mode). Built in.
-  var oam: Array[U8]  // Similar to VRAM, slightly less restricted.
   var hram: Array[U8] // Small array of high memory, built in. $FF80-FFFE.
 
   // Some, though not all, of the I/O ports in 0xff00-0xff7f are readable.
@@ -37,13 +137,31 @@ actor CPU
   // it goes from +/- 1 to 0, the interrupt flag actually changes.
   var interrupt_counter: I8 = 0
 
-  let ctrl: Controller tag
+  var halted: Bool = false
+  var stopped: Bool = false
+
+  var dma_counter: USize = 0
+
+  var div_counter: USize = 0
+  var timer_counter: USize = 0
+  // Indexed by the mode number in TAC.
+  let timer_maximums: Array[USize] = [256, 4, 16, 64]
+
+  var frame_counter: USize = 0
+  let lcd_mode_lengths: Array[USize] = [
+    51,   // 0: HBlank
+    1140, // 1: VBlank
+    20,   // 2: OAM locked
+    43    // 3: All locked
+  ]
+
+  var buttons_down: Array[Bool] = Array[Bool](8)
 
 
-  new reset(c: Controller tag, cart: Array[U8] val) =>
+  new reset(cart: Array[U8] val) =>
     // TODO: Implement me properly, with banking based on the cart type and so
     // on. For now, this assumes the basic 32KB ROM with no RAM or switching.
-    ctrl = c
+    gpu = GPU.create(this)
     regs = [0x01, 0xb0, 0x00, 0x13, 0x00, 0xd8, 0x01, 0x4d]
     flags = 0
     pc = 0x100
@@ -54,11 +172,10 @@ actor CPU
     ram = Array[U8](0)
 
     vram  = recover Array[U8](0x2000) end
+    oam   = recover Array[U8](0xa0) end
     wram  = Array[U8](0x2000)
-    oam   = Array[U8](0xa0)
     hram  = Array[U8](0x80)
     ports = Array[U8](0x80)
-
 
 
   // Memory map:
@@ -85,7 +202,7 @@ actor CPU
         try
           (vram as Array[U8] iso)((addr - 0x8000).usize())
         else
-          0
+          0xff
         end
       elseif addr < 0xc000 then
         ram((addr - 0xa000).usize())
@@ -94,7 +211,11 @@ actor CPU
       elseif addr < 0xfe00 then
         wram((addr - 0xe000).usize())
       elseif addr < 0xfea0 then
-        oam((addr - 0xfe00).usize())
+        try
+          (vram as Array[U8] iso)((addr - 0xfe00).usize())
+        else
+          0xff
+        end
       elseif addr < 0xff00 then
         0 // Unused portion
       elseif addr < 0xff80 then
@@ -133,7 +254,9 @@ actor CPU
       elseif addr < 0xfe00 then
         wram((addr - 0xe000).usize()) = value
       elseif addr < 0xfea0 then
-        oam((addr - 0xfe00).usize()) = value
+        try
+          (vram as Array[U8] iso)((addr - 0xfe00).usize()) = value
+        end
       elseif addr < 0xff00 then
         return // Unused portion
       elseif addr < 0xff80 then
@@ -250,6 +373,220 @@ actor CPU
     b
   fun ref pc_rw_plus(): U16 =>
     pc_rb_plus().u16() or (pc_rb_plus().u16() << 8)
+
+
+  // Interrupts
+  fun ref request_int(mask: U8) =>
+    let f = rb(Ports.iflag())
+    wb(Ports.iflag(), f or mask)
+
+  fun ref clear_int(mask: U8) =>
+    let f = rb(Ports.iflag())
+    wb(Ports.iflag(), f and (not mask))
+
+  fun ref handle_int(mask: U8) =>
+    halted = false
+    stopped = false
+
+
+  // Behaviors that send signals from other parts of the system.
+  be gpu_done(v: Array[U8] iso^, o: Array[U8] iso^) =>
+    vram = consume v
+    oam = consume o
+    run() // TODO: Maybe only do this if we know the CPU is waiting for GPU.
+
+  be button_down(b: USize) => handle_button(b, true)
+  be button_up(b: USize)   => handle_button(b, false)
+
+  fun ref handle_button(b: USize, down: Bool) =>
+    try buttons_down(b) = true end
+
+    // Trigger a joypad interrupt.
+    request_int(Interrupts.joypad_mask())
+
+    // The CPU might have been stopped. If it was, re-enable it.
+    if stopped then
+      stopped = false
+      run()
+    end
+
+
+  // Main interpreter function.
+  be run() =>
+    """
+    Main interpreter.
+    - Update interrupt_counter and interrupts_enabled if needed.
+    - Check for and execute interrupts.
+    - Run an instruction.
+    - Bump counters and timers. (Might trigger timer interrupt.)
+    - Transition LCD modes if necessary. (Might trigger STAT interrupt.)
+    - Call run() again (usually)
+    """
+
+    // When we're stopped, bail until a joypad signal awakens us.
+    if stopped then return end
+
+    // Adjust the interrupt_counter.
+    match interrupt_counter
+    | 0 => None
+    | 1 => interrupts_enabled = true; interrupt_counter = 0
+    | 2 => interrupt_counter = 1
+    | -1 => interrupts_enabled = false; interrupt_counter = 0
+    | -2 => interrupt_counter = -1
+    end
+
+    // Now check if an interrupt needs to be handled.
+    if interrupts_enabled then
+      let masked = rb(Ports.iflag()) and rb(Ports.ienable())
+      if masked > 0 then
+        handle_int(masked)
+      end
+    end
+
+    // If handle_interrupt fired, it just disables interrupts, pushes PC, and
+    // sets PC to the interrupt vector. Either way, I just keep executing.
+
+    // If we're stopped or halted, don't run any instruction.
+    // When halted, however, we let the display keep ticking around.
+
+    let cycles = if stopped or halted then
+      1
+    else
+      run_single_opcode(pc_rb_plus())
+    end
+
+    // There are several timers and things to bump:
+    // DIV is blindly bumped every 64 cycles.
+    // TIMA is bumped according to the TAC frequency (and if enabled)
+    // The latter triggers interrupts.
+    div_counter = div_counter + cycles
+    if div_counter >= 64 then
+      div_counter = div_counter - 64
+      let a = Ports.tdiv()
+      wb(a, rb(a) + 1)
+    end
+
+    let tac = rb(Ports.tac())
+    if (tac and 0x04) > 0 then
+      timer_counter = timer_counter + cycles
+      let max = try timer_maximums((tac and 3).usize()) else 0xff end
+      if timer_counter >= max then
+        timer_counter = timer_counter - max
+        var t = rb(Ports.tima())
+        if t == 0xff then
+          t = rb(Ports.tma())
+          request_int(Interrupts.timer_mask())
+        else
+          t = t + 1
+        end
+        wb(Ports.tima(), t)
+      end
+    end
+
+    // The last and most important counter is the one for LCD modes.
+    // We bump our internal count of that one too.
+    // Do nothing here if the LCD is disabled.
+    let ctrl = rb(Ports.lcdc())
+    if (ctrl and 0x80) > 0 then
+      var stat = rb(Ports.stat())
+      var mode = stat and 3
+      var ly_changed = false
+
+      // Bump the counter.
+      frame_counter = frame_counter + cycles
+      let max = try lcd_mode_lengths(mode.usize()) else 0 end
+      if frame_counter >= max then
+        match mode
+        | 1 => // Ending VBlank. Move to mode 2, OAM locked.
+          gpu.lock_oam(oam = None)
+          mode = 2
+          if (stat and 0x20) > 0 then request_int(Interrupts.stat_mask()) end
+          wb(Ports.ly(), 0) // Move to line 0.
+          ly_changed = true
+        | 2 => // Moving to mode 3, full lockup.
+          gpu.lock_vram(vram = None)
+          mode = 3
+          // No interrupt for this line.
+        | 3 => // Moving to HBlank.
+          mode = 0
+          if (stat and 0x08) > 0 then request_int(Interrupts.stat_mask()) end
+        | 0 => // Leaving HBlank for either VBlank or mode 2.
+          // First, bump the line number.
+          ly_changed = true
+          var ly = rb(Ports.ly())
+          ly = ly + 1
+          if ly > 143 then // Move to VBlank
+            mode = 1
+            if (stat and 0x10) > 0 then request_int(Interrupts.stat_mask()) end
+            request_int(Interrupts.vblank_mask())
+          else // Move to mode 2 (and lock the OAM)
+            mode = 2
+            gpu.lock_oam(oam = None)
+            if (stat and 0x20) > 0 then request_int(Interrupts.stat_mask()) end
+          end
+
+          wb(Ports.ly(), ly)
+        end
+
+        // Set stat to have the new mode.
+        stat = (stat and 0xfc) or mode
+      end
+
+      // Separately, during VBlank, we still want to keep the LY moving.
+      // A full line is 456 clks, or 114 cycles long.
+      if mode == 1 then
+        if ((frame_counter - cycles) / 114) < (frame_counter / 114) then
+          wb(Ports.ly(), rb(Ports.ly()) + 1)
+          ly_changed = true
+        end
+      end
+
+      // And finally, we check the coincidence interrupt if LY changed.
+      if ly_changed then
+        let ly = rb(Ports.ly())
+        Debug("New LY: " + ly.string())
+        let lyc = rb(Ports.lyc())
+        let coincidence = ly == lyc
+
+        // Trigger the interrupt only on this first transition.
+        if coincidence and ((stat and 0x40) > 0) then
+          request_int(Interrupts.stat_mask())
+        end
+
+        stat = (stat and (not 0x04)) or (if coincidence then 0x04 else 0 end)
+      end
+
+      wb(Ports.stat(), stat)
+
+
+
+
+
+
+  /*
+  Here's the complete state diagram for the CPU and GPU, with timings:
+  - Mode 1: VBlank, CPU owns the memory. We start here, effectively, because the
+    display starts out disabled.
+  ======
+  - Mode 2: OAM locked. The CPU sends the OAM iso to the GPU.
+    STAT, LY, etc. are updated at this point.
+    Timing: "77-83 clks" is 80 clks = 20 cycles
+  - Mode 3: Both locked. The CPU sends the VRAM iso to the GPU.
+    The line is actually rendered at this point.
+    Timing: "169-175 clks" 172 clks = 43 cycles
+  - Mode 0: HBlank. Both memory isos are returned to the CPU.
+    Timing: "201-207 clks" is 204 clks = 51 cycles
+  ======
+  The above cycles once for each line from 0 to 143, then VBlank begins. The
+  LY is still updated every 456 ticks, but there's 10(?) lines worth of dead
+  time. VBlank lasts 4560 clks = 1140 cycles. A complete frame lasts 70224 clks
+  or 17556 cycles, for a framerate of 1,048,576 / 17556 = 59.7275 fps
+
+  Since VBlank follows HBlank, no iso juggling happens there.
+  */
+
+    end
+
 
   // Returns the number of (real machine, not clock) cycles required.
   fun ref run_single_opcode(op: U8): USize =>
@@ -507,9 +844,9 @@ actor CPU
     // NOP
     | 0x00 => None
     // HALT
-    | 0x76 => ctrl.halt()
+    | 0x76 => halted = true
     // STOP
-    | 0x10 => pc_rb_plus(); ctrl.stop()
+    | 0x10 => pc_rb_plus(); stopped = true
     // DI
     | 0xf3 => interrupt_counter = -2
     // EI
@@ -1003,80 +1340,6 @@ actor CPU
     end
 
 
-actor Controller
-  """
-  Plan and design for the controller:
-  - Gets passed the loaded ROM as an Array[U8] val at startup.
-  - Creates a CPU, GPU and sound controller.
-  - Sets up a series of timers to call it periodically.
-    - Hopefully these timers are fast enough to do a ~1us timer for the GB
-      cycles.
-    - The strict frequency of the Gameboy is 4,194,304 clocks per second.
-      - Which is 1,048,576 machine cycles per second.
-      - Or an interval of 953.674316 nanoseconds.
-  - It counts the cycles off, and calls the CPU, GPU and others.
-    - The GPU gets called when it's time to do the next line.
-      - The STAT also needs to be updated at that point.
-  - OAM and VRAM are isos that are flipped periodically between CPU and GPU.
-    - Those two are independent! See the usual cycles flow.
-  - DMAs can be kicked off anytime according to some docs. Others say that the
-    OAM needs to be accessible to start a DMA. HBlanks are too short for a
-    complete DMA, so this doesn't work.
-    - Since only HRAM is accessible by the CPU during the DMA, we can simply do
-      the copy instantly and continue blocking all access to the memory.
-
-  TODO: See if I can pin down exactly when a DMA can be launched.
-  """
   be halt() => None
   be stop() => None
-
-class NotifyTest is TimerNotify
-  let main: Main tag
-  var count: U64 = 0
-  new create(m: Main tag) => main = m
-  fun ref apply(t: Timer, c: U64): Bool =>
-    count = count + c
-    main.ping()
-    count < 1000000
-
-  fun ref cancel(t: Timer) =>
-    main.done()
-
-actor Main
-  let _env: Env
-  var lastPing: U64 = 0
-  var intervals: Array[U64] = Array[U64](1000000)
-  var timers: Timers
-  new create(env: Env) =>
-    _env = env
-    let note = recover NotifyTest(this) end
-    timers = Timers(0)
-    timers(Timer.create(consume note, 30000, 953))
-
-
-  be ping() =>
-    if lastPing == 0 then lastPing = Time.now()._2.u64(); return end
-    let now = Time.now()._2.u64()
-    let delta = now - lastPing
-    lastPing = now
-    intervals.push(delta)
-
-  be done() =>
-    var widest: U64 = 0
-    var total: U64 = 0
-    var totalDiff: U64 = 0
-
-    for d in intervals.values() do
-      let absdiff = if d < 953 then 953 - d else d - 953 end
-      if absdiff > widest then widest = absdiff end
-      total = total + d
-      totalDiff = totalDiff + absdiff
-    end
-
-    _env.out.print("Widest variation: " + widest.string())
-    _env.out.print("Average variation: " + (totalDiff /
-        intervals.size().u64()).string())
-    _env.out.print("Average interval: " + (total / intervals.size().u64()).string())
-
-
 
