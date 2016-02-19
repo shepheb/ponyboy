@@ -1037,7 +1037,7 @@ class NotifyTest is TimerNotify
   fun ref apply(t: Timer, c: U64): Bool =>
     count = count + c
     main.ping()
-    count < 100000
+    count < 1000000
 
   fun ref cancel(t: Timer) =>
     main.done()
@@ -1045,17 +1045,20 @@ class NotifyTest is TimerNotify
 actor Main
   let _env: Env
   var lastPing: U64 = 0
-  var intervals: Array[U64] = Array[U64](100000)
-  var timer: Timer
+  var intervals: Array[U64] = Array[U64](1000000)
+  var timers: Timers
   new create(env: Env) =>
     _env = env
     let note = recover NotifyTest(this) end
-    timer = Timer.create(consume note, 30000, 953)
+    timers = Timers(0)
+    timers(Timer.create(consume note, 30000, 953))
+
 
   be ping() =>
-    if lastPing == 0 then lastPing = Time.nanos(); return end
-    let now = Time.nanos()
+    if lastPing == 0 then lastPing = Time.now()._2.u64(); return end
+    let now = Time.now()._2.u64()
     let delta = now - lastPing
+    lastPing = now
     intervals.push(delta)
 
   be done() =>
