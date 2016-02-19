@@ -1,3 +1,5 @@
+use "collections"
+use "time"
 use "debug"
 
 actor CPU
@@ -1017,17 +1019,61 @@ actor Controller
       - The STAT also needs to be updated at that point.
   - OAM and VRAM are isos that are flipped periodically between CPU and GPU.
     - Those two are independent! See the usual cycles flow.
-  - DMAs can be kicked off anytime. DMA reloads the OAM from some RAM. I don't
-    know what happens to the GPU during a DMA. Since the RAM is inaccessible
-    during a DMA, we can do the copy instantly, I guess.
-    - I don't know what happens to the GPU during that process.
-    - For now I'll just model it as instant.
-    - I'm not sure if the CPU needs to be allowed to write OAM to start a DMA.
-      They take 160 cycles - longer than an HBlank, I think? How does this work?
+  - DMAs can be kicked off anytime according to some docs. Others say that the
+    OAM needs to be accessible to start a DMA. HBlanks are too short for a
+    complete DMA, so this doesn't work.
+    - Since only HRAM is accessible by the CPU during the DMA, we can simply do
+      the copy instantly and continue blocking all access to the memory.
 
-  TODO: Figure out DMA and its restrictions, then figure out a plan for them.
-  TODO: Test the Pony timers library to see if it fires reliably enough to use
-  at this frequency.
+  TODO: See if I can pin down exactly when a DMA can be launched.
   """
   be halt() => None
   be stop() => None
+
+class NotifyTest is TimerNotify
+  let main: Main tag
+  var count: U64 = 0
+  new create(m: Main tag) => main = m
+  fun ref apply(t: Timer, c: U64): Bool =>
+    count = count + c
+    main.ping()
+    count < 100000
+
+  fun ref cancel(t: Timer) =>
+    main.done()
+
+actor Main
+  let _env: Env
+  var lastPing: U64 = 0
+  var intervals: Array[U64] = Array[U64](100000)
+  var timer: Timer
+  new create(env: Env) =>
+    _env = env
+    let note = recover NotifyTest(this) end
+    timer = Timer.create(consume note, 30000, 953)
+
+  be ping() =>
+    if lastPing == 0 then lastPing = Time.nanos(); return end
+    let now = Time.nanos()
+    let delta = now - lastPing
+    intervals.push(delta)
+
+  be done() =>
+    var widest: U64 = 0
+    var total: U64 = 0
+    var totalDiff: U64 = 0
+
+    for d in intervals.values() do
+      let absdiff = if d < 953 then 953 - d else d - 953 end
+      if absdiff > widest then widest = absdiff end
+      total = total + d
+      totalDiff = totalDiff + absdiff
+    end
+
+    _env.out.print("Widest variation: " + widest.string())
+    _env.out.print("Average variation: " + (totalDiff /
+        intervals.size().u64()).string())
+    _env.out.print("Average interval: " + (total / intervals.size().u64()).string())
+
+
+
