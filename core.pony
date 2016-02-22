@@ -95,8 +95,6 @@ actor CPU
     - 03:  16384 Hz = every  64 cycles
 
 
-
-
   TODO: See if I can pin down exactly when a DMA can be launched.
   """
   let gpu: GPU tag
@@ -130,7 +128,7 @@ actor CPU
   // memory.
   var ext_ram_offset: USize = 0
 
-  var interrupts_enabled: Bool = false // TODO: Check this one.
+  var interrupts_enabled: Bool = false
 
   // Since interrupts are enabled and disabled after the instruction after the
   // EI/DI is executed, this counter starts at 2 or -2 and ticks towards 0. When
@@ -154,13 +152,18 @@ actor CPU
     20,   // 2: OAM locked
     43    // 3: All locked
   ]
+  var waiting_on_gpu: Bool = false
 
+  // Buttons are indexed thus:
+  // right, left, up, down; A, B, select, start
+  // This corresponds to the order they appear in the JOYP register.
   var buttons_down: Array[Bool] = Array[Bool](8)
+  var buttons_dpad_selected: Bool = false
 
 
   new reset(cart: Array[U8] val) =>
-    // TODO: Implement me properly, with banking based on the cart type and so
-    // on. For now, this assumes the basic 32KB ROM with no RAM or switching.
+    // TODO: Figure out the memory controller, ROM and RAM sizes and use the
+    // right values. Currently assumes 32KB ROM, no RAM, and no banking.
     gpu = GPU.create(this)
     regs = [0x01, 0xb0, 0x00, 0x13, 0x00, 0xd8, 0x01, 0x4d]
     flags = 0
@@ -176,6 +179,45 @@ actor CPU
     wram  = Array[U8](0x2000)
     hram  = Array[U8](0x80)
     ports = Array[U8](0x80)
+
+    // Setting up the initial values of all the ports.
+    try
+      ports(0x05) = 0 // TIMA
+      ports(0x06) = 0 // TMA
+      ports(0x07) = 0 // TAC
+
+      ports(0x10) = 0x80 // NR10
+      ports(0x11) = 0xbf // NR11
+      ports(0x12) = 0xf3 // NR12
+      ports(0x14) = 0xbf // NR14
+      ports(0x16) = 0xf3 // NR21
+      ports(0x17) = 0x00 // NR22
+      ports(0x19) = 0xbf // NR24
+      ports(0x1a) = 0x7f // NR30
+      ports(0x1b) = 0xff // NR31
+      ports(0x1c) = 0x9f // NR32
+      ports(0x1e) = 0xbf // NR33
+      ports(0x20) = 0xff // NR41
+      ports(0x21) = 0x00 // NR42
+      ports(0x22) = 0x00 // NR43
+      ports(0x23) = 0xbf // NR30
+      ports(0x24) = 0x77 // NR50
+      ports(0x25) = 0xf3 // NR51
+      ports(0x26) = 0xf1 // NR52
+
+      ports(0x40) = 0x91 // LCDC
+      ports(0x42) = 0x00 // SCY
+      ports(0x43) = 0x00 // SCX
+      ports(0x45) = 0x00 // LYC
+      ports(0x47) = 0xfc // BGP
+      ports(0x48) = 0xff // OBP0
+      ports(0x49) = 0xff // OBP1
+      ports(0x4a) = 0x00 // WY
+      ports(0x4b) = 0x00 // WX
+
+      hram(0x7f) = 0x00 // IE
+    end
+
 
 
   // Memory map:
@@ -193,6 +235,16 @@ actor CPU
 
   fun rb(addr: U16): U8 =>
     """Responsible for the complicated memory map above."""
+
+    // While DMA is in progress, only the HRAM section is readable.
+    if dma_counter > 0 then
+      if (addr >= 0xff80) and (addr < 0xffff) then
+        return try hram((addr - 0xff80).usize()) else 0xff end
+      else
+        return 0xff
+      end
+    end
+
     try
       if addr < 0x4000 then
         rom(addr.usize())
@@ -230,8 +282,32 @@ actor CPU
     end
 
   fun rport(port: U16): U8 =>
-    // TODO: Implement this properly - not everything is readable.
-    try ports(port.usize()) else 0 end
+    let raw: U8 = try ports(port.usize()) else 0 end
+    match port
+    | 0xff46 => 0 // DMA is write-only.
+    | 0xff00 => // JOYP
+      // 0 is pressed! So we build a negative flag and then invert it.
+      let base: USize = if buttons_dpad_selected then 0 else 4 end
+      let negative: U8 = 0xf0 or
+          (if buttons_down(base + 0) then 1 else 0 end) or
+          (if buttons_down(base + 1) then 2 else 0 end) or
+          (if buttons_down(base + 2) then 4 else 0 end) or
+          (if buttons_down(base + 3) then 8 else 0 end)
+      not negative
+
+    // Sound stuff
+    | 0xff11 => raw and 0xc0 // NR11
+    | 0xff13 => 0 // NR13 is write-only.
+    | 0xff14 => raw and 0x40 // Only one readable bit in NR14.
+    | 0xff16 => raw and 0xc0 // NR21
+    | 0xff18 => 0 // NR23 is also write-only.
+    | 0xff19 => raw and 0x40 // Only one readable bit in NR24.
+    | 0xff1d => 0 // NR33 is write-only.
+    | 0xff1e => raw and 0x40 // Only one readable bit in NR34.
+    | 0xff23 => raw and 0x40 // Only one readable bit in NR44.
+    else
+      raw
+    end
 
   // Little-endian 16-bit reads and writes.
   fun rw(addr: U16): U16 => rb(addr).u16() or (rb(addr+1).u16() << 8)
@@ -240,6 +316,16 @@ actor CPU
 
   fun ref wb(addr: U16, value: U8) =>
     """Responsible for the complicated memory map above."""
+
+    // While DMA is in progress, only the HRAM is accessible.
+    if dma_counter > 0 then
+      if (addr >= 0xff80) and (addr < 0xffff) then
+        try hram((addr - 0xff80).usize()) = value end
+      end
+      return
+    end
+
+
     try
       if addr < 0x8000 then
         return // ROM is not writable...
@@ -274,8 +360,51 @@ actor CPU
     wb(addr, (v >> 8).u8())
 
   fun ref wport(port: U16, value: U8) =>
-    // TODO: Implement me properly! Many things need special handling on write.
-    None
+    let old = try ports(port.usize()) else return end
+    var nu = value
+    match port
+    | 0xff40 => // LCDC
+      // Most of these settings matter to the GPU, but if the LCD gets disabled
+      // we need to get the memory back from the GPU ASAP.
+      if ((old and 0x80) > 0) and ((value and 0x80) == 0) then
+        // Freshly disabled. Make it so.
+        gpu.disabled()
+        // It should immediately send back the memory.
+        // Set the STAT mode to 1 (VBlank)
+        let stat = rb(Ports.stat())
+        wb(Ports.stat(), (stat and (not 3)) or 1)
+      end
+    | 0xff41 => nu = value and 0x74
+    | 0xff44 => return
+    | 0xff46 => // DMA
+      // DMA can start anytime, and "instantly" fills the OAM from the target
+      // area, which always value << 8.
+      // TODO: This is actually kinda busted, since the OAM and VRAM might be
+      // passed to the GPU.
+      match oam | None => return end
+      for i in Range[U16](0, 0xa0) do
+        try
+          (oam as Array[U8] iso)(i.usize()) = rb((value.u16() << 8) or i)
+        end
+      end
+      dma_counter = 160
+
+      return
+    | 0xff00 => // JOYP
+      // Writing to this, choose which to select.
+      // TODO: What happens if both or neither are selected?
+      if (value and 0x20) == 0 then
+        buttons_dpad_selected = false
+      elseif (value and 0x10) == 0 then
+        buttons_dpad_selected = true
+      end
+      return
+
+    // Timers
+    | 0xff04 => nu = 0 // DIV - Writing anything here resets it to 0.
+    end
+    try ports(port.usize()) = nu end
+
 
   fun r_a(): U8 => try regs(0) else 0 end
   fun r_f(): U8 => try regs(1) else 0 end
@@ -387,27 +516,48 @@ actor CPU
   fun ref handle_int(mask: U8) =>
     halted = false
     stopped = false
+    interrupts_enabled = false
+    interrupt_counter = 0
+    // Work up the mask. The least significant bits are highest priority.
+    if (mask and Interrupts.vblank_mask()) > 0 then
+      pc = Interrupts.vector_vblank()
+    elseif (mask and Interrupts.timer_mask()) > 0 then
+      pc = Interrupts.vector_timer()
+    elseif (mask and Interrupts.serial_mask()) > 0 then
+      pc = Interrupts.vector_serial()
+    elseif (mask and Interrupts.joypad_mask()) > 0 then
+      pc = Interrupts.vector_joypad()
+    else
+      Debug("Bad interrupt mask - no such interrupt: " + mask.string())
+    end
+
 
 
   // Behaviors that send signals from other parts of the system.
-  be gpu_done(v: Array[U8] iso^, o: Array[U8] iso^) =>
-    vram = consume v
-    oam = consume o
-    run() // TODO: Maybe only do this if we know the CPU is waiting for GPU.
+  be gpu_done(v: (Array[U8] iso | None), o: (Array[U8] iso | None)) =>
+    match vram | None => vram = consume v end
+    match oam  | None => oam  = consume o end
+
+    if waiting_on_gpu then
+      waiting_on_gpu = false
+      run()
+    end
 
   be button_down(b: USize) => handle_button(b, true)
   be button_up(b: USize)   => handle_button(b, false)
 
   fun ref handle_button(b: USize, down: Bool) =>
-    try buttons_down(b) = true end
+    try buttons_down(b) = down end
 
-    // Trigger a joypad interrupt.
-    request_int(Interrupts.joypad_mask())
+    // Trigger a joypad interrupt on downward strokes only.
+    if down then
+      request_int(Interrupts.joypad_mask())
 
-    // The CPU might have been stopped. If it was, re-enable it.
-    if stopped then
-      stopped = false
-      run()
+      // The CPU might have been stopped. If it was, re-enable it.
+      if stopped then
+        stopped = false
+        run()
+      end
     end
 
 
@@ -437,7 +587,7 @@ actor CPU
 
     // Now check if an interrupt needs to be handled.
     if interrupts_enabled then
-      let masked = rb(Ports.iflag()) and rb(Ports.ienable())
+      let masked = rb(Ports.iflag()) and rb(Ports.ienable()) and 0x1f
       if masked > 0 then
         handle_int(masked)
       end
@@ -453,6 +603,10 @@ actor CPU
       1
     else
       run_single_opcode(pc_rb_plus())
+    end
+
+    if dma_counter > 0 then
+      dma_counter = if cycles > dma_counter then 0 else dma_counter - cycles end
     end
 
     // There are several timers and things to bump:
@@ -483,6 +637,8 @@ actor CPU
       end
     end
 
+    var keep_running = true
+
     // The last and most important counter is the one for LCD modes.
     // We bump our internal count of that one too.
     // Do nothing here if the LCD is disabled.
@@ -503,13 +659,23 @@ actor CPU
           if (stat and 0x20) > 0 then request_int(Interrupts.stat_mask()) end
           wb(Ports.ly(), 0) // Move to line 0.
           ly_changed = true
+
         | 2 => // Moving to mode 3, full lockup.
           gpu.lock_vram(vram = None)
+          gpu.paint_line(rb(Ports.ly()), rb(Ports.lcdc()), rb(Ports.scy()),
+              rb(Ports.scx()), rb(Ports.wy()), rb(Ports.wx()), rb(Ports.bgp()),
+              rb(Ports.obp0()), rb(Ports.obp1()))
           mode = 3
-          // No interrupt for this line.
+          // No interrupt for this mode.
+
         | 3 => // Moving to HBlank.
           mode = 0
           if (stat and 0x08) > 0 then request_int(Interrupts.stat_mask()) end
+
+          // If we don't have the memory back yet, we need to wait for the GPU.
+          match oam  | None => keep_running = false end
+          match vram | None => keep_running = false end
+
         | 0 => // Leaving HBlank for either VBlank or mode 2.
           // First, bump the line number.
           ly_changed = true
@@ -557,35 +723,9 @@ actor CPU
       end
 
       wb(Ports.stat(), stat)
-
-
-
-
-
-
-  /*
-  Here's the complete state diagram for the CPU and GPU, with timings:
-  - Mode 1: VBlank, CPU owns the memory. We start here, effectively, because the
-    display starts out disabled.
-  ======
-  - Mode 2: OAM locked. The CPU sends the OAM iso to the GPU.
-    STAT, LY, etc. are updated at this point.
-    Timing: "77-83 clks" is 80 clks = 20 cycles
-  - Mode 3: Both locked. The CPU sends the VRAM iso to the GPU.
-    The line is actually rendered at this point.
-    Timing: "169-175 clks" 172 clks = 43 cycles
-  - Mode 0: HBlank. Both memory isos are returned to the CPU.
-    Timing: "201-207 clks" is 204 clks = 51 cycles
-  ======
-  The above cycles once for each line from 0 to 143, then VBlank begins. The
-  LY is still updated every 456 ticks, but there's 10(?) lines worth of dead
-  time. VBlank lasts 4560 clks = 1140 cycles. A complete frame lasts 70224 clks
-  or 17556 cycles, for a framerate of 1,048,576 / 17556 = 59.7275 fps
-
-  Since VBlank follows HBlank, no iso juggling happens there.
-  */
-
     end
+
+    if keep_running then run() end
 
 
   // Returns the number of (real machine, not clock) cycles required.
@@ -1339,7 +1479,4 @@ actor CPU
       pc = popw()
     end
 
-
-  be halt() => None
-  be stop() => None
 
