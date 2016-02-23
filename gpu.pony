@@ -41,8 +41,7 @@ actor GPU
 
     let e1 = @SDL_Init[USize](U32(0x0020) /* INIT_VIDEO */)
     if e1 != 0 then
-      Debug("SDL_Init failed: " +
-          String.copy_cstring(@SDL_GetError[Pointer[U8]]()))
+      Debug("SDL_Init failed: " + sdl_error())
     end
 
     _window = @SDL_CreateWindow[Pointer[_SDLWindow]]("Ponyboy".cstring(),
@@ -228,6 +227,26 @@ actor GPU
     // the CPU.
     cpu.gpu_done(vram = None, oam = None)
 
+  be vblank() =>
+    """
+    Expected to be called at the start of VBlank - that is, when all visible
+    lines have been rendered and it's time to paint to the display.
+
+    This behavior flips the color array in pixels into the SDL texture, and onto
+    the screen.
+    """
+    var e = @SDL_UpdateTexture[ISize](_texture, Pointer[None], pixels.cstring(), 4 * width)
+    if e < 0 then Debug("Error in SDL_UpdateTexture: " + sdl_error()); return end
+
+    e = @SDL_RenderClear[ISize](_renderer)
+    if e < 0 then Debug("Error in SDL_RenderClear: " + sdl_error()); return end
+
+    e = @SDL_RenderCopy[ISize](_renderer, _texture, Pointer[None],
+        Pointer[None])
+    if e < 0 then Debug("Error in SDL_RenderCopy: " + sdl_error()); return end
+
+    @SDL_RenderPresent[None](_renderer)
+
 
   fun ref renderSprites(aboveBG: Bool, ly: U8, lx: USize, obp0: U8, obp1: U8):
       Bool ? =>
@@ -358,6 +377,8 @@ actor GPU
     end
 
 
+  fun tag sdl_error(): String val =>
+    recover val String.copy_cstring(@SDL_GetError[Pointer[U8]]()) end
 
   be dispose() =>
     @SDL_DestroyTexture[None](_texture)

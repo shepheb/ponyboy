@@ -2,6 +2,9 @@ use "collections"
 use "time"
 use "debug"
 
+type GBFormat is
+    FormatSettingsHolder[FormatHexSmallBare, PrefixDefault, FormatSettingsDefault]
+
 primitive Ports
   fun lcdc(): U16 => 0xff40
   fun stat(): U16 => 0xff41
@@ -685,6 +688,7 @@ actor CPU
             mode = 1
             if (stat and 0x10) > 0 then request_int(Interrupts.stat_mask()) end
             request_int(Interrupts.vblank_mask())
+            gpu.vblank()
           else // Move to mode 2 (and lock the OAM)
             mode = 2
             gpu.lock_oam(oam = None)
