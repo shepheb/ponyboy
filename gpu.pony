@@ -184,140 +184,178 @@ actor GPU
     try
       for lx in Range[USize](0, 160) do
         // Topmost layer: Sprites when above the background, and enabled.
-        if (lcdc and 0x02) != 0 then // Sprites enabled
-          match spriteAt(lx)
-          | (let y: U8, let x: U8, let tile: U8, let flags: U8) =>
-            if (flags and 0x80) == 0 then // OBJ above BG when bit 7 = 0
-              // Determine the colour based on the tile number.
-              let pi = spritePaletteIndex(y, x, tile)
-              if pi != 0 then
-                setColor(lx, ly.usize(), spriteColor(pi, flags, obp0, obp1))
-                continue
-              end
-            end
-          end
+        if ((lcdc and 0x02) != 0) and
+            renderSprites(true /* above BG */, ly, lx, obp0, obp1) then
+          continue
         end
 
         // Second layer: Window, when enabled and scrolled up sufficiently.
         if ((lcdc and 0x20) != 0) and (wy <= ly) and (wx <= (lx.u8() + 7)) then
-          // The window, even its color 0, renders on top. The window is not
-          // scrollable, so check which tile map it's using and grab that tile.
-          let base: USize = if (lcdc and 0x40) != 0 then 0x1c00 else 0x1800 end
-          // TODO: Double-check this math.
-          let relX = (lx.isize() - (wx.isize() - 7)).usize()
-          let relY = ly.usize() - wy.usize()
-          // Each tile is 8x8, so we need to shift both right by 3.
-          let tileIndex = ((relY >> 3) * 32) + (relX >> 3)
-          let tile = (vram as Array[U8] iso)(base + tileIndex)
-
-          let pi = backgroundPaletteIndex((relY and 7).u8(), (relX and 7).u8(),
-              tile, lcdc)
-          setColor(lx, ly.usize(), bgColor(pi, bgp))
+          renderWindow(ly, lx, wy, wx, lcdc, bgp)
+          // The window, even its color 0, renders on top. If the window
+          // overlays this location, then it always wins and we unconditionally
+          // continue.
           continue
         end
 
-        // START HERE with the third layer.
         // Third layer: Background, colors 1-3 when enabled.
+        if (lcdc and 0x01) != 0 then
+          if renderBackground(ly, lx, scy, scx, lcdc, bgp) then
+            continue
+          end
+        end
 
         // Fourth layer: Sprites, when enabled and under the background.
+        if ((lcdc and 0x02) != 0) and
+            renderSprites(false /* below BG */, ly, lx, obp0, obp1) then
+          continue
+        end
 
         // Fifth layer: Background color at palette index 0, when BG is enabled.
+        if (lcdc and 0x01) != 0 then
+          setColor(lx, ly.usize(), bgColor(0, bgp))
+          continue
+        end
 
         // Final fallback: White.
-
+        setColor(lx, ly.usize(), 0)
       end
     else
       Debug("Error while rendering the row.")
     end
-    /*
-    Bit 7 - LCD Display Enable             (0=Off, 1=On)
-    Bit 6 - Window Tile Map Display Select (0=9800-9BFF, 1=9C00-9FFF)
-    Bit 5 - Window Display Enable          (0=Off, 1=On)
-    Bit 4 - BG & Window Tile Data Select   (0=8800-97FF, 1=8000-8FFF)
-    Bit 3 - BG Tile Map Display Select     (0=9800-9BFF, 1=9C00-9FFF)
-    Bit 2 - OBJ (Sprite) Size              (0=8x8, 1=8x16)
-    Bit 1 - OBJ (Sprite) Display Enable    (0=Off, 1=On)
-    Bit 0 - BG Display (for CGB see below) (0=Off, 1=On)
-    */
+
+    // When we're done painting the line, we unlock the memory and return it to
+    // the CPU.
+    cpu.gpu_done(vram = None, oam = None)
 
 
-    /*
-    Then we process the pixels from right to left.
-    - If the sprite is on top of the background, figure out the colour.
-      - If nonzero, check the palette (OBP0 or 1) and determine the real colour.
-        Write it into the screen buffer.
-      - If 0, that's transparent, so ignore the sprite and draw the background.
-    - Draw the window, if present and the sprite wasn't on top or is
-      transparent. Even window colour 0 is on top.
-    - If no window, then draw the background. Unless the colour is 0, in which
-      case the under-sprites can be seen.
-    - Sprites that appear under the background are here, but colour 0 is still
-      transparent.
-    - BG colour 0 is under everything, as a last resort.
-    */
+  fun ref renderSprites(aboveBG: Bool, ly: U8, lx: USize, obp0: U8, obp1: U8):
+      Bool ? =>
+    """
+    Renders sprites from spriteAt that appear above or below the background
+    depending on aboveBG.
 
-
-    fun spritePaletteIndex(y: U8, x: U8, tile: U8): U8 =>
-      """Returns the index into the palette for the given tile and sprite."""
-      let addr = tile.usize() * 16
-      tilePaletteIndex(y, x, addr)
-
-    fun backgroundPaletteIndex(y: U8, x: U8, tile: U8, lcdc: U8): U8 =>
-      """
-      For background or window, checks which tile data region is in use, and
-      returns the correct palette number at that location.
-      """
-      let addr = if (lcdc and 0x10) != 0 then // 1 = unsigned from 0x8000
-        tile.usize() * 16
-      else // 0 = signed from 0x9000
-        (0x1000 + (tile.i8().isize() * 16)).usize()
+    Returns true if there is such a sprite at this pixel, and its color was
+    not transparent.
+    """
+    match spriteAt(lx)
+    | (let y: U8, let x: U8, let tile: U8, let flags: U8) =>
+      // OBJ above BG when bit 7 = 0, hence the awkward comparison.
+      if ((flags and 0x80) == 0) == aboveBG then
+        // Determine the colour based on the tile number.
+        let pi = spritePaletteIndex(y, x, tile)
+        if pi != 0 then
+          setColor(lx, ly.usize(), spriteColor(pi, flags, obp0, obp1))
+          return true
+        end
       end
+    end
+    false
 
-      tilePaletteIndex(y, x, addr)
+  fun ref renderWindow(ly: U8, lx: USize, wy: U8, wx: U8, lcdc: U8, bgp: U8) ? =>
+    // The window is always on top of the BG. Its corner is movable, but
+    // it's not scrollable, so check which tile map it's using and grab
+    // that tile.
+    let base: USize = if (lcdc and 0x40) != 0 then 0x1c00 else 0x1800 end
+    // TODO: Double-check this math.
+    let relX = (lx.isize() - (wx.isize() - 7)).usize()
+    let relY = ly.usize() - wy.usize()
+    // Each tile is 8x8, so we need to shift both right by 3.
+    let tileIndex = ((relY >> 3) * 32) + (relX >> 3)
+    let tile = (vram as Array[U8] iso)(base + tileIndex)
 
-    fun tilePaletteIndex(y: U8, x: U8, addr: USize): U8 =>
-      """
-      Given the address of the start of a tile in VRAM, and the
-      sprite-relative x and y coordinates, returns the index into the palette.
-      """
-      // Each two bytes represents a line, so advance the address by y * 2
-      let addr' = addr + (y.usize() * 2)
-      // Then we're looking at the 7-x'th bit in that byte and the next one.
-      let shift = 7 - x
-      try
-        let lo = (vram as Array[U8] iso)(addr)
-        let hi = (vram as Array[U8] iso)(addr + 1)
-        ((lo >> shift) and 1) or (((hi >> shift) and 1) << 1)
-      else
-        Debug("Error looking up the palette index for a tile.")
-        0
-      end
+    let pi = backgroundPaletteIndex((relY and 7).u8(), (relX and 7).u8(),
+        tile, lcdc)
+    setColor(lx, ly.usize(), bgColor(pi, bgp))
 
-    fun spriteColor(paletteIndex: U8, flags: U8, obp0: U8, obp1: U8): U8 =>
-      indexToColorNumber(paletteIndex,
-          if (flags and 0x10) != 0 then obp1 else obp0 end)
+  fun ref renderBackground(ly: U8, lx: USize, scy: U8, scx: U8, lcdc: U8,
+      bgp: U8): Bool ? =>
+    // The background is 256x256 pixels and scrolls, so the actual
+    // location we're looking for is (x + sx, y + sy) modulo 256.
 
-    // Nothing special for handling backgrounds in monochrome mode.
-    fun bgColor(paletteIndex: U8, palette: U8): U8 =>
-      indexToColorNumber(paletteIndex, palette)
+    // Grab the right map data for the background.
+    let base: USize = if (lcdc and 0x08) != 0 then 0x1c00 else 0x1800 end
 
-    fun indexToColorNumber(index: U8, palette: U8): U8 =>
-      // Shift it left by paletteIndex * 2 and take the two lowest bits.
-      (palette >> (index * 2)) and 3
+    // Calculate the actual location we're targeting.
+    let relX = (lx + scx.usize()) and 255
+    let relY = (ly.usize() + scy.usize()) and 255
+
+    // Tiles are 8x8, so we're actually looking for these shifted by 3.
+    let tileX = relX >> 3
+    let tileY = relY >> 3
+    let tileIndex = (tileY * 32) + tileX
+    let tile = (vram as Array[U8] iso)(base + tileIndex)
+
+    let pi = backgroundPaletteIndex((relY and 7).u8(), (relX and 7).u8(),
+        tile, lcdc)
+    // Color 0 is always behind under-sprites.
+    if pi > 0 then
+      setColor(lx, ly.usize(), bgColor(pi, bgp))
+      return true
+    end
+    false
+
+  fun spritePaletteIndex(y: U8, x: U8, tile: U8): U8 =>
+    """Returns the index into the palette for the given tile and sprite."""
+    let addr = tile.usize() * 16
+    tilePaletteIndex(y, x, addr)
+
+  fun backgroundPaletteIndex(y: U8, x: U8, tile: U8, lcdc: U8): U8 =>
+    """
+    For background or window, checks which tile data region is in use, and
+    returns the correct palette number at that location.
+    """
+    let addr = if (lcdc and 0x10) != 0 then // 1 = unsigned from 0x8000
+      tile.usize() * 16
+    else // 0 = signed from 0x9000
+      (0x1000 + (tile.i8().isize() * 16)).usize()
+    end
+
+    tilePaletteIndex(y, x, addr)
+
+  fun tilePaletteIndex(y: U8, x: U8, addr: USize): U8 =>
+    """
+    Given the address of the start of a tile in VRAM, and the
+    sprite-relative x and y coordinates, returns the index into the palette.
+    """
+    // Each two bytes represents a line, so advance the address by y * 2
+    let addr' = addr + (y.usize() * 2)
+    // Then we're looking at the 7-x'th bit in that byte and the next one.
+    let shift = 7 - x
+    try
+      let lo = (vram as Array[U8] iso)(addr)
+      let hi = (vram as Array[U8] iso)(addr + 1)
+      ((lo >> shift) and 1) or (((hi >> shift) and 1) << 1)
+    else
+      Debug("Error looking up the palette index for a tile.")
+      0
+    end
+
+  fun spriteColor(paletteIndex: U8, flags: U8, obp0: U8, obp1: U8): U8 =>
+    indexToColorNumber(paletteIndex,
+        if (flags and 0x10) != 0 then obp1 else obp0 end)
+
+  // Nothing special for handling backgrounds in monochrome mode.
+  fun bgColor(paletteIndex: U8, palette: U8): U8 =>
+    indexToColorNumber(paletteIndex, palette)
+
+  fun indexToColorNumber(index: U8, palette: U8): U8 =>
+    // Shift it left by paletteIndex * 2 and take the two lowest bits.
+    (palette >> (index * 2)) and 3
 
 
-    fun ref setColor(x: USize, y: USize, color: U8) =>
-      """
-      Takes a real color number (0-3) and writes that colour into the texture.
-      0 = white, 1 = light gray, 2 = dark grey, 3 = black.
-      For now I'm using simple-minded pure greyscale, not classic GB greenish.
-      0 = #fff, 1 = #ddd, 2 = #555, 3 = #000
-      """
-      try
-        pixels((y * width) + x) = colors(color.usize())
-      else
-        Debug("Error writing to pixel (" + x.string() + ", " + y.string() + ")")
-      end
+  fun ref setColor(x: USize, y: USize, color: U8) =>
+    """
+    Takes a real color number (0-3) and writes that colour into the texture.
+    0 = white, 1 = light gray, 2 = dark grey, 3 = black.
+    For now I'm using simple-minded pure greyscale, not classic GB greenish.
+    0 = #fff, 1 = #ddd, 2 = #555, 3 = #000
+    """
+    try
+      pixels((y * width) + x) = colors(color.usize())
+    else
+      Debug("Error writing to pixel (" + x.string() + ", " + y.string() + ")")
+    end
 
 
 
