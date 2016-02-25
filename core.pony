@@ -2,9 +2,6 @@ use "collections"
 use "time"
 use "debug"
 
-type GBFormat is
-    FormatSettingsHolder[FormatHexSmallBare, PrefixDefault, FormatSettingsDefault]
-
 primitive Ports
   fun lcdc(): U16 => 0xff40
   fun stat(): U16 => 0xff41
@@ -119,11 +116,11 @@ actor CPU
   var vram: (Array[U8] iso | None)
   var oam:  (Array[U8] iso | None)
 
-  var wram: Array[U8] // Read-write, no bank (except in CGB mode). Built in.
-  var hram: Array[U8] // Small array of high memory, built in. $FF80-FFFE.
+  var wram: Array[U8] ref // Read-write, no bank (except in CGB mode). Built in.
+  var hram: Array[U8] ref // Small array of high memory, built in. $FF80-FFFE.
 
   // Some, though not all, of the I/O ports in 0xff00-0xff7f are readable.
-  var ports: Array[U8]
+  var ports: Array[U8] ref
 
   // Offset for the switchable ROM, 0x4000-7ffff.
   var rom_offset: USize = 0
@@ -160,8 +157,15 @@ actor CPU
   // Buttons are indexed thus:
   // right, left, up, down; A, B, select, start
   // This corresponds to the order they appear in the JOYP register.
-  var buttons_down: Array[Bool] = Array[Bool](8)
+  var buttons_down: Array[Bool] = Array[Bool].init(false, 8)
   var buttons_dpad_selected: Bool = false
+
+  let fmtByte: FormatSettingsInt = FormatSettingsInt.set_format(FormatHexBare)
+      .set_width(2)
+      .set_fill('0')
+  let fmtWord: FormatSettingsInt = FormatSettingsInt.set_format(FormatHexBare)
+      .set_width(4)
+      .set_fill('0')
 
 
   new reset(cart: Array[U8] val) =>
@@ -177,11 +181,11 @@ actor CPU
 
     ram = Array[U8](0)
 
-    vram  = recover Array[U8](0x2000) end
-    oam   = recover Array[U8](0xa0) end
-    wram  = Array[U8](0x2000)
-    hram  = Array[U8](0x80)
-    ports = Array[U8](0x80)
+    vram  = recover Array[U8].init(0, 0x2000) end
+    oam   = recover Array[U8].init(0, 0xa0) end
+    wram  = Array[U8].init(0, 0x2000)
+    hram  = Array[U8].init(0, 0x80)
+    ports = Array[U8].init(0, 0x80)
 
     // Setting up the initial values of all the ports.
     try
@@ -208,9 +212,11 @@ actor CPU
       ports(0x25) = 0xf3 // NR51
       ports(0x26) = 0xf1 // NR52
 
-      ports(0x40) = 0x91 // LCDC
+      ports(0x40) = 0x91 // LCDC - Display enabled, low tile data, BG enabled.
+      ports(0x41) = 0x01 // STAT - Mode 1 = VBlank
       ports(0x42) = 0x00 // SCY
       ports(0x43) = 0x00 // SCX
+      ports(0x44) = 0x99 // LY - Last line of VBlank
       ports(0x45) = 0x00 // LYC
       ports(0x47) = 0xfc // BGP
       ports(0x48) = 0xff // OBP0
@@ -219,6 +225,8 @@ actor CPU
       ports(0x4b) = 0x00 // WX
 
       hram(0x7f) = 0x00 // IE
+    else
+      Debug("Error in initializing I/O ports")
     end
 
 
@@ -285,8 +293,9 @@ actor CPU
     end
 
   fun rport(port: U16): U8 =>
-    let raw: U8 = try ports(port.usize()) else 0 end
-    match port
+    let raw: U8 = try ports(port.usize()) else Debug("Failed to read port " +
+    port.string(fmtByte)); 0 end
+    match 0xff00 or port
     | 0xff46 => 0 // DMA is write-only.
     | 0xff00 => // JOYP
       // 0 is pressed! So we build a negative flag and then invert it.
@@ -363,9 +372,13 @@ actor CPU
     wb(addr, (v >> 8).u8())
 
   fun ref wport(port: U16, value: U8) =>
+    """
+    Called when the user writes to a port. Internal writes should generally be
+    done with wport_raw() to prevent read-only bits from being enforced.
+    """
     let old = try ports(port.usize()) else return end
     var nu = value
-    match port
+    match 0xff00 or port
     | 0xff40 => // LCDC
       // Most of these settings matter to the GPU, but if the LCD gets disabled
       // we need to get the memory back from the GPU ASAP.
@@ -375,9 +388,9 @@ actor CPU
         // It should immediately send back the memory.
         // Set the STAT mode to 1 (VBlank)
         let stat = rb(Ports.stat())
-        wb(Ports.stat(), (stat and (not 3)) or 1)
+        wport_raw(Ports.stat(), (stat and (not 3)) or 1)
       end
-    | 0xff41 => nu = value and 0x74
+    | 0xff41 => nu = value and 0x78
     | 0xff44 => return
     | 0xff46 => // DMA
       // DMA can start anytime, and "instantly" fills the OAM from the target
@@ -407,6 +420,9 @@ actor CPU
     | 0xff04 => nu = 0 // DIV - Writing anything here resets it to 0.
     end
     try ports(port.usize()) = nu end
+
+  fun ref wport_raw(port: U16, value: U8) =>
+    try ports((port - 0xff00).usize()) = value end
 
 
   fun r_a(): U8 => try regs(0) else 0 end
@@ -579,6 +595,14 @@ actor CPU
     // When we're stopped, bail until a joypad signal awakens us.
     if stopped then return end
 
+    try Debug("PC = " + pc.string(fmtWord) + " " +
+        "A = " + regs(0).string(fmtByte) + " " +
+        "B = " + regs(2).string(fmtByte) + " " +
+        "C = " + regs(3).string(fmtByte) + " " +
+        "D = " + regs(4).string(fmtByte) + " " +
+        "E = " + regs(5).string(fmtByte) + " " +
+        "HL = " + r_hl().string(fmtWord)) end
+
     // Adjust the interrupt_counter.
     match interrupt_counter
     | 0 => None
@@ -592,6 +616,7 @@ actor CPU
     if interrupts_enabled then
       let masked = rb(Ports.iflag()) and rb(Ports.ienable()) and 0x1f
       if masked > 0 then
+        Debug("Interrupt triggered! Mask: " + masked.string(fmtByte))
         handle_int(masked)
       end
     end
@@ -646,6 +671,7 @@ actor CPU
     // We bump our internal count of that one too.
     // Do nothing here if the LCD is disabled.
     let ctrl = rb(Ports.lcdc())
+    Debug("LCDC: " + ctrl.string(fmtByte))
     if (ctrl and 0x80) > 0 then
       var stat = rb(Ports.stat())
       var mode = stat and 3
@@ -655,15 +681,18 @@ actor CPU
       frame_counter = frame_counter + cycles
       let max = try lcd_mode_lengths(mode.usize()) else 0 end
       if frame_counter >= max then
+        Debug("Leaving mode " + mode.string())
         match mode
         | 1 => // Ending VBlank. Move to mode 2, OAM locked.
+          Debug("VBlank ending. Moving to mode 2, locking OAM.")
           gpu.lock_oam(oam = None)
           mode = 2
           if (stat and 0x20) > 0 then request_int(Interrupts.stat_mask()) end
-          wb(Ports.ly(), 0) // Move to line 0.
+          wport_raw(Ports.ly(), 0) // Move to line 0.
           ly_changed = true
 
         | 2 => // Moving to mode 3, full lockup.
+          Debug("Moving to mode 3, locking VRAM")
           gpu.lock_vram(vram = None)
           gpu.paint_line(rb(Ports.ly()), rb(Ports.lcdc()), rb(Ports.scy()),
               rb(Ports.scx()), rb(Ports.wy()), rb(Ports.wx()), rb(Ports.bgp()),
@@ -672,6 +701,7 @@ actor CPU
           // No interrupt for this mode.
 
         | 3 => // Moving to HBlank.
+          Debug("Moving to HBlank, painting a line.")
           mode = 0
           if (stat and 0x08) > 0 then request_int(Interrupts.stat_mask()) end
 
@@ -679,23 +709,29 @@ actor CPU
           match oam  | None => keep_running = false end
           match vram | None => keep_running = false end
 
+          if not keep_running then waiting_on_gpu = true end
+          Debug("  keep_running = " + keep_running.string())
+
         | 0 => // Leaving HBlank for either VBlank or mode 2.
           // First, bump the line number.
           ly_changed = true
           var ly = rb(Ports.ly())
           ly = ly + 1
+          Debug("HBlank over. ly bumped to " + ly.string())
           if ly > 143 then // Move to VBlank
+            Debug("Moving to VBlank")
             mode = 1
             if (stat and 0x10) > 0 then request_int(Interrupts.stat_mask()) end
             request_int(Interrupts.vblank_mask())
             gpu.vblank()
           else // Move to mode 2 (and lock the OAM)
+            Debug("Moving to mode 2 and starting the next line")
             mode = 2
             gpu.lock_oam(oam = None)
             if (stat and 0x20) > 0 then request_int(Interrupts.stat_mask()) end
           end
 
-          wb(Ports.ly(), ly)
+          wport_raw(Ports.ly(), ly)
         end
 
         // Set stat to have the new mode.
@@ -706,7 +742,7 @@ actor CPU
       // A full line is 456 clks, or 114 cycles long.
       if mode == 1 then
         if ((frame_counter - cycles) / 114) < (frame_counter / 114) then
-          wb(Ports.ly(), rb(Ports.ly()) + 1)
+          wport_raw(Ports.ly(), rb(Ports.ly()) + 1)
           ly_changed = true
         end
       end
@@ -726,7 +762,7 @@ actor CPU
         stat = (stat and (not 0x04)) or (if coincidence then 0x04 else 0 end)
       end
 
-      wb(Ports.stat(), stat)
+      wport_raw(Ports.stat(), stat)
     end
 
     if keep_running then run() end
@@ -828,8 +864,8 @@ actor CPU
     | 0xf2 => cycles = 2; try op_ld_a_indir(regs(3).u16() + 0xff00) end
     | 0xe2 => cycles = 2; try op_ld_indir_a(regs(3).u16() + 0xff00) end
     // HRAM loads: with immediate
-    | 0xe0 => cycles = 3; op_ld_a_indir(pc_rb_plus().u16() + 0xff00)
-    | 0xf0 => cycles = 3; op_ld_indir_a(pc_rb_plus().u16() + 0xff00)
+    | 0xe0 => cycles = 3; op_ld_indir_a(pc_rb_plus().u16() + 0xff00)
+    | 0xf0 => cycles = 3; op_ld_a_indir(pc_rb_plus().u16() + 0xff00)
 
     // 16-bit loads
     | 0x01 => cycles = 3; w_bc(pc_rw_plus())
@@ -1226,7 +1262,7 @@ actor CPU
     let b' = if carry and r_fC() then b + 1 else b end
     set_fH( ( ((a and 0xf) or 0x10) - (b' and 0xf) ) > 0xf)
     set_fC( ((a.u16() or 0x100) - b'.u16()) > 0xff )
-    let r = a + b'
+    let r = a - b'
     set_fZ(r == 0)
     s_fN()
     r

@@ -22,11 +22,11 @@ actor GPU
 
   // An array of (offset, relative-y, absolute-x)
   var spritesByCoordinate: Array[((USize, U8) | None)] ref =
-      Array[((USize, U8) | None)](168)
+      Array[((USize, U8) | None)].init(None, 168)
   var spriteAt: Array[((U8, U8, U8, U8) | None)] ref =
-      Array[((U8, U8, U8, U8) | None)](160)
+      Array[((U8, U8, U8, U8) | None)].init(None, 160)
 
-  var pixels: Array[U32] ref = Array[U32](width * height)
+  var pixels: Array[U32] ref = Array[U32].init(0xffffffff, width * height)
 
   let colors: Array[U32] = [
     0xffffffff, // White
