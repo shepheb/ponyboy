@@ -2,9 +2,38 @@ use "collections"
 use "lib:SDL2"
 use "debug"
 
+// SDL calls
+use @SDL_Init[ISize](flags: U32)
+use @SDL_CreateWindow[Pointer[_SDLWindow] tag](title: Pointer[U8] tag,
+    x: ISize, y: ISize, w: ISize, h: ISize, flags: U32)
+use @SDL_CreateRenderer[Pointer[_SDLRenderer] tag](
+    window: Pointer[_SDLWindow] tag, index: ISize, flags: U32)
+use @SDL_CreateTexture[Pointer[_SDLTexture] tag](
+    renderer: Pointer[_SDLRenderer] tag, format: U32, access: ISize,
+    w: ISize, h: ISize)
+
+use @SDL_UpdateTexture[ISize](texture: Pointer[_SDLTexture] tag,
+    rect: Pointer[_SDLRect] tag, pixels: Pointer[U8] tag /* void* */,
+    pitch: ISize)
+
+use @SDL_RenderClear[ISize](renderer: Pointer[_SDLRenderer] tag)
+use @SDL_RenderCopy[ISize](renderer: Pointer[_SDLRenderer] tag,
+    texture: Pointer[_SDLTexture] tag,
+    srcrect: Pointer[_SDLRect] tag, dstrect: Pointer[_SDLRect] tag)
+use @SDL_RenderPresent[None](renderer: Pointer[_SDLRenderer] tag)
+
+use @SDL_DestroyWindow[None](window: Pointer[_SDLWindow] tag)
+use @SDL_DestroyRenderer[None](renderer: Pointer[_SDLRenderer] tag)
+use @SDL_DestroyTexture[None](texture: Pointer[_SDLTexture] tag)
+
+use @SDL_GetError[Pointer[U8] box]()
+
+
 primitive _SDLWindow
 primitive _SDLRenderer
 primitive _SDLTexture
+primitive _SDLRect
+
 
 actor GPU
   var oam: (Array[U8] iso | None) = None
@@ -12,9 +41,9 @@ actor GPU
 
   let cpu: CPU tag
 
-  let width: USize = 160
-  let height: USize = 160
-  let scale: USize = 1 // Attempts to render the texture scaled up by this much.
+  let width: ISize = 160
+  let height: ISize = 160
+  let scale: ISize = 1 // Attempts to render the texture scaled up by this much.
 
   let _window: Pointer[_SDLWindow] tag
   let _renderer: Pointer[_SDLRenderer] tag
@@ -26,7 +55,7 @@ actor GPU
   var spriteAt: Array[((U8, U8, U8, U8) | None)] ref =
       Array[((U8, U8, U8, U8) | None)].init(None, 160)
 
-  var pixels: Array[U32] ref = Array[U32].init(0xffffffff, width * height)
+  var pixels: Array[U32] ref = Array[U32].init(0xffffffff, (width * height).usize())
 
   let colors: Array[U32] = [
     0xffffffff, // White
@@ -39,19 +68,20 @@ actor GPU
   new create(c: CPU tag) =>
     cpu = c
 
-    let e1 = @SDL_Init[USize](U32(0x0020) /* INIT_VIDEO */)
+    let e1 = @SDL_Init[ISize](U32(0x0020) /* INIT_VIDEO */)
     if e1 != 0 then
       Debug("SDL_Init failed: " + sdl_error())
     end
 
-    _window = @SDL_CreateWindow[Pointer[_SDLWindow]]("Ponyboy".cstring(),
-        USize(100), USize(100), width * scale, height * scale, U32(0004))
+    _window = @SDL_CreateWindow[Pointer[_SDLWindow] tag]("Ponyboy".cstring(),
+        ISize(100), ISize(100), (width * scale).isize(),
+        (height * scale).isize(), U32(0004))
         // SDL_WINDOW_SHOWN
 
-    _renderer = @SDL_CreateRenderer[Pointer[_SDLRenderer]](_window, ISize(-1),
-        U32(6) /* ACCELERATED | PRESENTVSYNC */)
+    _renderer = @SDL_CreateRenderer[Pointer[_SDLRenderer] tag](_window,
+        ISize(-1), U32(6) /* ACCELERATED | PRESENTVSYNC */)
 
-    _texture = @SDL_CreateTexture[Pointer[_SDLTexture]](_renderer,
+    _texture = @SDL_CreateTexture[Pointer[_SDLTexture] tag](_renderer,
         U32(0x16362004) /* PIXELFORMAT_ARGB8888 */,
         ISize(1), /* TEXTUREACCESS_STREAMING */
         width, height)
@@ -235,14 +265,32 @@ actor GPU
     This behavior flips the color array in pixels into the SDL texture, and onto
     the screen.
     """
-    var e = @SDL_UpdateTexture[ISize](_texture, Pointer[None], pixels.cstring(), 4 * width)
+
+    // Copy the pixel data from a Array[U32] to Array[U8].
+    // TODO: It should probably always be this, and use SDL_LockTexture instead.
+    var px = Array[U8].undefined((width * height * 4).usize())
+    // TODO: I think this is little-endian specific! Not ideal, but meh.
+    try
+      for i in Range[USize](0, (width * height).usize()) do
+        px((4 * i) + 0) = ( pixels(i)        and 255).u8() // blue, low byte
+        px((4 * i) + 1) = ((pixels(i) >>  8) and 255).u8() // green, second byte
+        px((4 * i) + 2) = ((pixels(i) >> 16) and 255).u8() // red, third byte
+        px((4 * i) + 3) = ((pixels(i) >> 24) and 255).u8() // alpha, high byte
+      end
+    else
+      Debug("Error copying pixels to px. Can't happen?")
+      return
+    end
+
+    var e = @SDL_UpdateTexture[ISize](_texture, Pointer[_SDLRect],
+        px.cstring(), 4 * width)
     if e < 0 then Debug("Error in SDL_UpdateTexture: " + sdl_error()); return end
 
     e = @SDL_RenderClear[ISize](_renderer)
     if e < 0 then Debug("Error in SDL_RenderClear: " + sdl_error()); return end
 
-    e = @SDL_RenderCopy[ISize](_renderer, _texture, Pointer[None],
-        Pointer[None])
+    e = @SDL_RenderCopy[ISize](_renderer, _texture,
+        Pointer[_SDLRect], Pointer[_SDLRect])
     if e < 0 then Debug("Error in SDL_RenderCopy: " + sdl_error()); return end
 
     @SDL_RenderPresent[None](_renderer)
@@ -371,14 +419,14 @@ actor GPU
     0 = #fff, 1 = #ddd, 2 = #555, 3 = #000
     """
     try
-      pixels((y * width) + x) = colors(color.usize())
+      pixels((y * width.usize()) + x) = colors(color.usize())
     else
       Debug("Error writing to pixel (" + x.string() + ", " + y.string() + ")")
     end
 
 
   fun tag sdl_error(): String val =>
-    recover val String.copy_cstring(@SDL_GetError[Pointer[U8]]()) end
+    recover val String.copy_cstring(@SDL_GetError[Pointer[U8] box]()) end
 
   be dispose() =>
     @SDL_DestroyTexture[None](_texture)
