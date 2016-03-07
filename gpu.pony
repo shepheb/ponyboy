@@ -42,7 +42,7 @@ actor GPU
   let cpu: CPU tag
 
   let width: ISize = 160
-  let height: ISize = 160
+  let height: ISize = 144
   let scale: ISize = 1 // Attempts to render the texture scaled up by this much.
 
   let _window: Pointer[_SDLWindow] tag
@@ -265,7 +265,6 @@ actor GPU
     This behavior flips the color array in pixels into the SDL texture, and onto
     the screen.
     """
-
     // Copy the pixel data from a Array[U32] to Array[U8].
     // TODO: It should probably always be this, and use SDL_LockTexture instead.
     var px = Array[U8].undefined((width * height * 4).usize())
@@ -284,16 +283,22 @@ actor GPU
 
     var e = @SDL_UpdateTexture[ISize](_texture, Pointer[_SDLRect],
         px.cstring(), 4 * width)
+    Debug("===> Top of vblank")
+
     if e < 0 then Debug("Error in SDL_UpdateTexture: " + sdl_error()); return end
 
+    Debug("===> After UpdateTexture")
     e = @SDL_RenderClear[ISize](_renderer)
     if e < 0 then Debug("Error in SDL_RenderClear: " + sdl_error()); return end
 
+    Debug("===> After RenderClear")
     e = @SDL_RenderCopy[ISize](_renderer, _texture,
         Pointer[_SDLRect], Pointer[_SDLRect])
     if e < 0 then Debug("Error in SDL_RenderCopy: " + sdl_error()); return end
 
+    Debug("===> After RenderCopy")
     @SDL_RenderPresent[None](_renderer)
+    Debug("===> After RenderPresent -- end of vblank")
 
 
   fun ref renderSprites(aboveBG: Bool, ly: U8, lx: USize, obp0: U8, obp1: U8):
