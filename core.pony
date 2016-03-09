@@ -681,6 +681,7 @@ actor CPU
       frame_counter = frame_counter + cycles
       let max = try lcd_mode_lengths(mode.usize()) else 0 end
       if frame_counter >= max then
+        frame_counter = frame_counter - max
         Debug("Leaving mode " + mode.string())
         match mode
         | 1 => // Ending VBlank. Move to mode 2, OAM locked.

@@ -3,21 +3,21 @@ use "lib:SDL2"
 use "debug"
 
 // SDL calls
-use @SDL_Init[ISize](flags: U32)
+use @SDL_Init[I32](flags: U32)
 use @SDL_CreateWindow[Pointer[_SDLWindow] tag](title: Pointer[U8] tag,
-    x: ISize, y: ISize, w: ISize, h: ISize, flags: U32)
+    x: I32, y: I32, w: I32, h: I32, flags: U32)
 use @SDL_CreateRenderer[Pointer[_SDLRenderer] tag](
-    window: Pointer[_SDLWindow] tag, index: ISize, flags: U32)
+    window: Pointer[_SDLWindow] tag, index: I32, flags: U32)
 use @SDL_CreateTexture[Pointer[_SDLTexture] tag](
-    renderer: Pointer[_SDLRenderer] tag, format: U32, access: ISize,
-    w: ISize, h: ISize)
+    renderer: Pointer[_SDLRenderer] tag, format: U32, access: I32,
+    w: I32, h: I32)
 
-use @SDL_UpdateTexture[ISize](texture: Pointer[_SDLTexture] tag,
+use @SDL_UpdateTexture[I32](texture: Pointer[_SDLTexture] tag,
     rect: Pointer[_SDLRect] tag, pixels: Pointer[U8] tag /* void* */,
-    pitch: ISize)
+    pitch: I32)
 
-use @SDL_RenderClear[ISize](renderer: Pointer[_SDLRenderer] tag)
-use @SDL_RenderCopy[ISize](renderer: Pointer[_SDLRenderer] tag,
+use @SDL_RenderClear[I32](renderer: Pointer[_SDLRenderer] tag)
+use @SDL_RenderCopy[I32](renderer: Pointer[_SDLRenderer] tag,
     texture: Pointer[_SDLTexture] tag,
     srcrect: Pointer[_SDLRect] tag, dstrect: Pointer[_SDLRect] tag)
 use @SDL_RenderPresent[None](renderer: Pointer[_SDLRenderer] tag)
@@ -41,9 +41,9 @@ actor GPU
 
   let cpu: CPU tag
 
-  let width: ISize = 160
-  let height: ISize = 144
-  let scale: ISize = 1 // Attempts to render the texture scaled up by this much.
+  let width: I32 = 160
+  let height: I32 = 144
+  let scale: I32 = 1 // Attempts to render the texture scaled up by this much.
 
   let _window: Pointer[_SDLWindow] tag
   let _renderer: Pointer[_SDLRenderer] tag
@@ -68,22 +68,22 @@ actor GPU
   new create(c: CPU tag) =>
     cpu = c
 
-    let e1 = @SDL_Init[ISize](U32(0x0020) /* INIT_VIDEO */)
+    let e1 = @SDL_Init[I32](U32(0x0020) /* INIT_VIDEO */)
     if e1 != 0 then
       Debug("SDL_Init failed: " + sdl_error())
     end
 
     _window = @SDL_CreateWindow[Pointer[_SDLWindow] tag]("Ponyboy".cstring(),
-        ISize(100), ISize(100), (width * scale).isize(),
-        (height * scale).isize(), U32(0004))
+        I32(100), I32(100), (width * scale).i32(),
+        (height * scale).i32(), U32(0004))
         // SDL_WINDOW_SHOWN
 
     _renderer = @SDL_CreateRenderer[Pointer[_SDLRenderer] tag](_window,
-        ISize(-1), U32(6) /* ACCELERATED | PRESENTVSYNC */)
+        I32(-1), U32(6) /* ACCELERATED | PRESENTVSYNC */)
 
     _texture = @SDL_CreateTexture[Pointer[_SDLTexture] tag](_renderer,
         U32(0x16362004) /* PIXELFORMAT_ARGB8888 */,
-        ISize(1), /* TEXTUREACCESS_STREAMING */
+        I32(1), /* TEXTUREACCESS_STREAMING */
         width, height)
 
 
@@ -130,16 +130,16 @@ actor GPU
       the even-numbered one.
     - Sprites can be flipped in both dimensions.
     """
-    let sprite_height: ISize = if (lcdc and 0x04) == 0 then 8 else 16 end
+    let sprite_height: I32 = if (lcdc and 0x04) == 0 then 8 else 16 end
     try for i in Range[USize](0, 40) do spritesByCoordinate(i) = None end end
     try
       for i in Reverse[USize](39, 0) do
         let offset = 4 * i
-        let y = (oam as Array[U8] iso)(offset).isize() - 16
-        if (y <= ly.isize()) and (y.isize() < (ly.isize() + sprite_height)) then
+        let y = (oam as Array[U8] iso)(offset).i32() - 16
+        if (y <= ly.i32()) and (y.i32() < (ly.i32() + sprite_height)) then
           // This should be lowered by 8, but it's easier to index this way.
-          let x = (oam as Array[U8] iso)(offset + 1).isize()
-          spritesByCoordinate(x.usize()) = (i, (ly.isize() - y).u8())
+          let x = (oam as Array[U8] iso)(offset + 1).i32()
+          spritesByCoordinate(x.usize()) = (i, (ly.i32() - y).u8())
         end
       end
     end
@@ -191,10 +191,10 @@ actor GPU
           let flipX = (flags and 0x20) != 0
 
           // Handle flipping for the attrs where needed.
-          let lo: USize = (i.isize() - 8).max(0).usize()
+          let lo: USize = (i.i32() - 8).max(0).usize()
           let hi: USize = i.min(160)
           for j in Range[USize](lo, hi) do
-            let x = (j.isize() - 8) - lo.isize()
+            let x = (j.i32() - 8) - lo.i32()
             spriteAt(j) = (y, if flipX then 7 - x.u8() else x.u8() end, tile, flags)
           end
         end
@@ -281,18 +281,18 @@ actor GPU
       return
     end
 
-    var e = @SDL_UpdateTexture[ISize](_texture, Pointer[_SDLRect],
-        px.cstring(), 4 * width)
     Debug("===> Top of vblank")
+    var e = @SDL_UpdateTexture[I32](_texture, Pointer[_SDLRect],
+        px.cstring(), 4 * width)
 
     if e < 0 then Debug("Error in SDL_UpdateTexture: " + sdl_error()); return end
 
     Debug("===> After UpdateTexture")
-    e = @SDL_RenderClear[ISize](_renderer)
+    e = @SDL_RenderClear[I32](_renderer)
     if e < 0 then Debug("Error in SDL_RenderClear: " + sdl_error()); return end
 
     Debug("===> After RenderClear")
-    e = @SDL_RenderCopy[ISize](_renderer, _texture,
+    e = @SDL_RenderCopy[I32](_renderer, _texture,
         Pointer[_SDLRect], Pointer[_SDLRect])
     if e < 0 then Debug("Error in SDL_RenderCopy: " + sdl_error()); return end
 
@@ -330,7 +330,7 @@ actor GPU
     // that tile.
     let base: USize = if (lcdc and 0x40) != 0 then 0x1c00 else 0x1800 end
     // TODO: Double-check this math.
-    let relX = (lx.isize() - (wx.isize() - 7)).usize()
+    let relX = (lx.i32() - (wx.i32() - 7)).usize()
     let relY = ly.usize() - wy.usize()
     // Each tile is 8x8, so we need to shift both right by 3.
     let tileIndex = ((relY >> 3) * 32) + (relX >> 3)
@@ -380,7 +380,7 @@ actor GPU
     let addr = if (lcdc and 0x10) != 0 then // 1 = unsigned from 0x8000
       tile.usize() * 16
     else // 0 = signed from 0x9000
-      (0x1000 + (tile.i8().isize() * 16)).usize()
+      (0x1000 + (tile.i8().i32() * 16)).usize()
     end
 
     tilePaletteIndex(y, x, addr)
