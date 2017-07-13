@@ -58,9 +58,9 @@ actor GPU
   var pixels: Array[U32] ref = Array[U32].init(0xffffffff, (width * height).usize())
 
   let colors: Array[U32] = [
-    0xffffffff, // White
-    0xffcccccc, // Light grey
-    0xff666666, // Dark grey
+    0xffffffff // White
+    0xffcccccc // Light grey
+    0xff666666 // Dark grey
     0xff000000  // Black
   ]
 
@@ -267,7 +267,7 @@ actor GPU
     """
     // Copy the pixel data from a Array[U32] to Array[U8].
     // TODO: It should probably always be this, and use SDL_LockTexture instead.
-    var px = Array[U8].undefined((width * height * 4).usize())
+    var px = Array[U8]((width * height * 4).usize())
     // TODO: I think this is little-endian specific! Not ideal, but meh.
     try
       for i in Range[USize](0, (width * height).usize()) do
@@ -283,7 +283,7 @@ actor GPU
 
     Debug("===> Top of vblank")
     var e = @SDL_UpdateTexture[I32](_texture, Pointer[_SDLRect],
-        px.cstring(), 4 * width)
+        px.cpointer(), 4 * width)
 
     if e < 0 then Debug("Error in SDL_UpdateTexture: " + sdl_error()); return end
 
@@ -367,12 +367,12 @@ actor GPU
     end
     false
 
-  fun spritePaletteIndex(y: U8, x: U8, tile: U8): U8 =>
+  fun ref spritePaletteIndex(y: U8, x: U8, tile: U8): U8 =>
     """Returns the index into the palette for the given tile and sprite."""
     let addr = tile.usize() * 16
     tilePaletteIndex(y, x, addr)
 
-  fun backgroundPaletteIndex(y: U8, x: U8, tile: U8, lcdc: U8): U8 =>
+  fun ref backgroundPaletteIndex(y: U8, x: U8, tile: U8, lcdc: U8): U8 =>
     """
     For background or window, checks which tile data region is in use, and
     returns the correct palette number at that location.
@@ -385,7 +385,7 @@ actor GPU
 
     tilePaletteIndex(y, x, addr)
 
-  fun tilePaletteIndex(y: U8, x: U8, addr: USize): U8 =>
+  fun ref tilePaletteIndex(y: U8, x: U8, addr: USize): U8 =>
     """
     Given the address of the start of a tile in VRAM, and the
     sprite-relative x and y coordinates, returns the index into the palette.

@@ -1,6 +1,6 @@
 use "collections"
+use "format"
 use "time"
-use "debug"
 
 primitive Ports
   fun lcdc(): U16 => 0xff40
@@ -143,13 +143,13 @@ actor CPU
   var div_counter: USize = 0
   var timer_counter: USize = 0
   // Indexed by the mode number in TAC.
-  let timer_maximums: Array[USize] = [256, 4, 16, 64]
+  let timer_maximums: Array[USize] = [256; 4; 16; 64]
 
   var frame_counter: USize = 0
   let lcd_mode_lengths: Array[USize] = [
-    51,   // 0: HBlank
-    1140, // 1: VBlank
-    20,   // 2: OAM locked
+    51    // 0: HBlank
+    1140  // 1: VBlank
+    20    // 2: OAM locked
     43    // 3: All locked
   ]
   var waiting_on_gpu: Bool = false
@@ -160,19 +160,14 @@ actor CPU
   var buttons_down: Array[Bool] = Array[Bool].init(false, 8)
   var buttons_dpad_selected: Bool = false
 
-  let fmtByte: FormatSettingsInt = FormatSettingsInt.set_format(FormatHexBare)
-      .set_width(2)
-      .set_fill('0')
-  let fmtWord: FormatSettingsInt = FormatSettingsInt.set_format(FormatHexBare)
-      .set_width(4)
-      .set_fill('0')
+  let _env: Env
 
-
-  new reset(cart: Array[U8] val) =>
+  new reset(env: Env, cart: Array[U8] val) =>
     // TODO: Figure out the memory controller, ROM and RAM sizes and use the
     // right values. Currently assumes 32KB ROM, no RAM, and no banking.
+    _env = env
     gpu = GPU.create(this)
-    regs = [0x01, 0xb0, 0x00, 0x13, 0x00, 0xd8, 0x01, 0x4d]
+    regs = [0x01; 0xb0; 0x00; 0x13; 0x00; 0xd8; 0x01; 0x4d]
     flags = 0
     pc = 0x100
     sp = 0xfffe
@@ -226,7 +221,7 @@ actor CPU
 
       hram(0x7f) = 0x00 // IE
     else
-      Debug("Error in initializing I/O ports")
+      _env.out.print("Error in initializing I/O ports")
     end
 
 
@@ -244,7 +239,7 @@ actor CPU
   // ff80-fffe: High RAM (HRAM)
   // ffff:      Interrupt enable register
 
-  fun rb(addr: U16): U8 =>
+  fun ref rb(addr: U16): U8 =>
     """Responsible for the complicated memory map above."""
 
     // While DMA is in progress, only the HRAM section is readable.
@@ -267,6 +262,14 @@ actor CPU
         else
           0xff
         end
+        /*
+        match vram = None
+        | None => 0xff
+        | let v: Array[U8] iso =>
+          v((addr - 0x8000).usize())
+          vram = consume v
+        end
+        */
       elseif addr < 0xc000 then
         ram((addr - 0xa000).usize())
       elseif addr < 0xe000 then
@@ -293,18 +296,18 @@ actor CPU
     end
 
   fun rport(port: U16): U8 =>
-    let raw: U8 = try ports(port.usize()) else Debug("Failed to read port " +
-    port.string(fmtByte)); 0 end
+    let raw: U8 = try ports(port.usize()) else _env.out.print("Failed to read port " + fmtWord(port)); 0 end
     match 0xff00 or port
     | 0xff46 => 0 // DMA is write-only.
     | 0xff00 => // JOYP
       // 0 is pressed! So we build a negative flag and then invert it.
       let base: USize = if buttons_dpad_selected then 0 else 4 end
-      let negative: U8 = 0xf0 or
+      let negative: U8 = try 0xf0 or
           (if buttons_down(base + 0) then 1 else 0 end) or
           (if buttons_down(base + 1) then 2 else 0 end) or
           (if buttons_down(base + 2) then 4 else 0 end) or
           (if buttons_down(base + 3) then 8 else 0 end)
+        else 0 end
       not negative
 
     // Sound stuff
@@ -322,8 +325,7 @@ actor CPU
     end
 
   // Little-endian 16-bit reads and writes.
-  fun rw(addr: U16): U16 => rb(addr).u16() or (rb(addr+1).u16() << 8)
-
+  fun ref rw(addr: U16): U16 => rb(addr).u16() or (rb(addr+1).u16() << 8)
 
 
   fun ref wb(addr: U16, value: U8) =>
@@ -514,7 +516,7 @@ actor CPU
 
 
   // PC accessors
-  fun pc_rb(): U8 => rb(pc)
+  fun ref pc_rb(): U8 => rb(pc)
   fun ref pc_rb_plus(): U8 =>
     let b = rb(pc)
     pc = pc + 1
@@ -547,9 +549,14 @@ actor CPU
     elseif (mask and Interrupts.joypad_mask()) > 0 then
       pc = Interrupts.vector_joypad()
     else
-      Debug("Bad interrupt mask - no such interrupt: " + mask.string())
+      _env.out.print("Bad interrupt mask - no such interrupt: " + mask.string())
     end
 
+
+  fun tag fmtByte(value: U8): String iso^ =>
+    Format.int[U8](value where width = 2, fill = '0')
+  fun tag fmtWord(value: U16): String iso^ =>
+    Format.int[U16](value where width = 4, fill = '0')
 
 
   // Behaviors that send signals from other parts of the system.
@@ -595,13 +602,13 @@ actor CPU
     // When we're stopped, bail until a joypad signal awakens us.
     if stopped then return end
 
-    try Debug("PC = " + pc.string(fmtWord) + " " +
-        "A = " + regs(0).string(fmtByte) + " " +
-        "B = " + regs(2).string(fmtByte) + " " +
-        "C = " + regs(3).string(fmtByte) + " " +
-        "D = " + regs(4).string(fmtByte) + " " +
-        "E = " + regs(5).string(fmtByte) + " " +
-        "HL = " + r_hl().string(fmtWord)) end
+    try _env.out.print("PC = " + fmtWord(pc) + " " +
+        "A = " + fmtByte(regs(0)) + " " +
+        "B = " + fmtByte(regs(2)) + " " +
+        "C = " + fmtByte(regs(3)) + " " +
+        "D = " + fmtByte(regs(4)) + " " +
+        "E = " + fmtByte(regs(5)) + " " +
+        "HL = " + fmtWord(r_hl())) end
 
     // Adjust the interrupt_counter.
     match interrupt_counter
@@ -616,7 +623,7 @@ actor CPU
     if interrupts_enabled then
       let masked = rb(Ports.iflag()) and rb(Ports.ienable()) and 0x1f
       if masked > 0 then
-        Debug("Interrupt triggered! Mask: " + masked.string(fmtByte))
+        _env.out.print("Interrupt triggered! Mask: " + fmtByte(masked))
         handle_int(masked)
       end
     end
@@ -671,7 +678,7 @@ actor CPU
     // We bump our internal count of that one too.
     // Do nothing here if the LCD is disabled.
     let ctrl = rb(Ports.lcdc())
-    Debug("LCDC: " + ctrl.string(fmtByte))
+    _env.out.print("LCDC: " + fmtByte(ctrl))
     if (ctrl and 0x80) > 0 then
       var stat = rb(Ports.stat())
       var mode = stat and 3
@@ -682,10 +689,10 @@ actor CPU
       let max = try lcd_mode_lengths(mode.usize()) else 0 end
       if frame_counter >= max then
         frame_counter = frame_counter - max
-        Debug("Leaving mode " + mode.string())
+        _env.out.print("Leaving mode " + mode.string())
         match mode
         | 1 => // Ending VBlank. Move to mode 2, OAM locked.
-          Debug("VBlank ending. Moving to mode 2, locking OAM.")
+          _env.out.print("VBlank ending. Moving to mode 2, locking OAM.")
           gpu.lock_oam(oam = None)
           mode = 2
           if (stat and 0x20) > 0 then request_int(Interrupts.stat_mask()) end
@@ -693,7 +700,7 @@ actor CPU
           ly_changed = true
 
         | 2 => // Moving to mode 3, full lockup.
-          Debug("Moving to mode 3, locking VRAM")
+          _env.out.print("Moving to mode 3, locking VRAM")
           gpu.lock_vram(vram = None)
           gpu.paint_line(rb(Ports.ly()), rb(Ports.lcdc()), rb(Ports.scy()),
               rb(Ports.scx()), rb(Ports.wy()), rb(Ports.wx()), rb(Ports.bgp()),
@@ -702,7 +709,7 @@ actor CPU
           // No interrupt for this mode.
 
         | 3 => // Moving to HBlank.
-          Debug("Moving to HBlank, painting a line.")
+          _env.out.print("Moving to HBlank, painting a line.")
           mode = 0
           if (stat and 0x08) > 0 then request_int(Interrupts.stat_mask()) end
 
@@ -711,22 +718,22 @@ actor CPU
           match vram | None => keep_running = false end
 
           if not keep_running then waiting_on_gpu = true end
-          Debug("  keep_running = " + keep_running.string())
+          _env.out.print("  keep_running = " + keep_running.string())
 
         | 0 => // Leaving HBlank for either VBlank or mode 2.
           // First, bump the line number.
           ly_changed = true
           var ly = rb(Ports.ly())
           ly = ly + 1
-          Debug("HBlank over. ly bumped to " + ly.string())
+          _env.out.print("HBlank over. ly bumped to " + ly.string())
           if ly > 143 then // Move to VBlank
-            Debug("Moving to VBlank")
+            _env.out.print("Moving to VBlank")
             mode = 1
             if (stat and 0x10) > 0 then request_int(Interrupts.stat_mask()) end
             request_int(Interrupts.vblank_mask())
             gpu.vblank()
           else // Move to mode 2 (and lock the OAM)
-            Debug("Moving to mode 2 and starting the next line")
+            _env.out.print("Moving to mode 2 and starting the next line")
             mode = 2
             gpu.lock_oam(oam = None)
             if (stat and 0x20) > 0 then request_int(Interrupts.stat_mask()) end
@@ -751,7 +758,7 @@ actor CPU
       // And finally, we check the coincidence interrupt if LY changed.
       if ly_changed then
         let ly = rb(Ports.ly())
-        Debug("New LY: " + ly.string())
+        _env.out.print("New LY: " + ly.string())
         let lyc = rb(Ports.lyc())
         let coincidence = ly == lyc
 
@@ -1097,7 +1104,7 @@ actor CPU
     | 0xcb => run_single_extended_opcode(pc_rb_plus())
 
     else
-      Debug("Unknown standard opcode: " + op.string())
+      _env.out.print("Unknown standard opcode: " + op.string())
     end
     cycles
 
@@ -1200,7 +1207,7 @@ actor CPU
     | 0x86 => cycles = 4; bit_reset_hl()
 
     else
-      Debug("Unknown extended opcode " + op.string())
+      _env.out.print("Unknown extended opcode " + op.string())
     end
     cycles
 
